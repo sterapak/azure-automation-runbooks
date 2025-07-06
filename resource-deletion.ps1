@@ -1,14 +1,16 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Runbook to purge most resources across selected subscriptions, with safeties to preserve automation assets.
+    Runbook to delete all resources (not resource groups) across selected subscriptions,
+    skipping protected types and moving undeletable ones to trashbin-rg.
 #>
 
-# 1) Authenticate under the Automation Account’s Managed Identity
+$ErrorActionPreference = "Stop"
+
 Write-Output "Logging into Azure via Managed Identity..."
 Connect-AzAccount -Identity
 
-# 2) Define your “friendly names” of the subscriptions to process
+# Friendly subscription names
 $desiredFriendlyNames = @(
     "CIS130 - Azure Cloud Fundamentals",
     "CAI105 - Azure AI Fundamentals",
@@ -16,105 +18,97 @@ $desiredFriendlyNames = @(
     "CLD332 - Microsoft Azure Security Technologies"
 )
 
-# 3) List all subscriptions accessible to this identity
+# Load all accessible subscriptions
 $allSubs = Get-AzSubscription
-
-# 4) Filter to only those whose Name matches our list
 $targetSubs = $allSubs | Where-Object { $desiredFriendlyNames -contains $_.Name }
+
 if ($targetSubs.Count -ne $desiredFriendlyNames.Count) {
     $missing = $desiredFriendlyNames | Where-Object { $_ -notin $targetSubs.Name }
     Write-Warning "Could not find these subscriptions: $($missing -join ', ')"
 }
 
-# 5) Name of the “trash-bin” RG
+# Skip these resource types from deletion
+$protectedTypes = @(
+    "Microsoft.Automation/automationAccounts",
+    "Microsoft.Automation/automationAccounts/runbooks"
+)
+
 $trashBinName = "trashbin-rg"
+$processedSubIds = @{}
 
-foreach ($subObj in $targetSubs) {
-    $subName = $subObj.Name
-    $subId   = $subObj.Id
+foreach ($sub in $targetSubs) {
+    $subId = $sub.Id
+    $subName = $sub.Name
 
-    Write-Output "==============================================="
-    Write-Output "Switching context to Subscription:`n   Name: ${subName}`n   Id:   ${subId}"
+    if ($processedSubIds.ContainsKey($subId)) {
+        Write-Warning "Already processed ${subName} — skipping."
+        continue
+    }
+    $processedSubIds[$subId] = $true
 
-    # 6) Switch context
+    Write-Output "`n==============================================="
+    Write-Output "Switching to subscription: ${subName} (${subId})"
+
     try {
-        Set-AzContext -SubscriptionId $subId | Out-Null
+        Set-AzContext -SubscriptionId $subId -Force | Out-Null
     }
     catch {
-        Write-Error "Failed to set context to subscription ${subId}: $_"
+        $err = $_.Exception.Message
+        Write-Warning "Failed to set context to ${subName}: ${err}"
         continue
     }
 
-    # Ensure trash-bin RG exists
-    $existingTrash = Get-AzResourceGroup -Name $trashBinName -ErrorAction SilentlyContinue
-    if (-not $existingTrash) {
-        $firstRG    = Get-AzResourceGroup | Select-Object -First 1
-        $rgLocation = if ($firstRG) { $firstRG.Location } else { "eastus" }
-        Write-Output "Creating RG [${trashBinName}] in [${rgLocation}]..."
-        try {
-            New-AzResourceGroup -Name $trashBinName `
-                                -Location $rgLocation `
-                                -Tag @{ instructor="azure-automation"; name="azure-automation" } | Out-Null
-            Write-Output "Created RG: ${trashBinName}"
-        }
-        catch {
-            Write-Error "Could not create RG ${trashBinName}: $_"
-        }
-    }
-    else {
-        Write-Output "RG [${trashBinName}] already exists."
+    # Create trashbin-rg if missing
+    if (-not (Get-AzResourceGroup -Name $trashBinName -ErrorAction SilentlyContinue)) {
+        $location = (Get-AzResourceGroup | Select-Object -First 1).Location
+        if (-not $location) { $location = "eastus" }
+        Write-Output "Creating resource group '${trashBinName}' in ${location}"
+        New-AzResourceGroup -Name $trashBinName -Location $location -Force | Out-Null
     }
 
-    # Gather RGs to process (skip trash-bin and any with “automation” in name)
-    $allRGs    = Get-AzResourceGroup | Select-Object -ExpandProperty ResourceGroupName
-    $targetRGs = $allRGs | Where-Object { $_ -ne $trashBinName -and ($_ -notmatch "(?i)automation") }
-
-    if ($targetRGs.Count -eq 0) {
-        Write-Output "No eligible RGs found. Skipping subscription."
-        continue
+    # Get all RGs except automation and trashbin
+    $rgs = Get-AzResourceGroup | Where-Object {
+        $_.ResourceGroupName -ne $trashBinName -and $_.ResourceGroupName -notmatch "automation"
     }
 
-    # Loop through each RG’s resources
-    foreach ($rgName in $targetRGs) {
-        Write-Output "→ Processing RG: ${rgName}"
+    foreach ($rg in $rgs) {
+        Write-Output "→ Processing RG: $($rg.ResourceGroupName)"
 
-        $resources = Get-AzResource -ResourceGroupName $rgName
+        $resources = Get-AzResource -ResourceGroupName $rg.ResourceGroupName
         if (-not $resources) {
-            Write-Output "   • No resources in [${rgName}]."
+            Write-Output "   • No resources to delete."
             continue
         }
 
         foreach ($res in $resources) {
-            $resName       = $res.Name
-            $resType       = $res.ResourceType
-            $resId         = $res.ResourceId
-            $resApiVersion = $res.ApiVersion
+            $type = $res.ResourceType
+            $name = $res.Name
+            $id   = $res.ResourceId
+            $api  = $res.ApiVersion
 
-            # Skip the Automation Account, azure-delete and resource-deletion runbooks
-            if ($resType -eq 'Microsoft.Automation/automationAccounts' `
-                -or ($resType -eq 'Microsoft.Automation/automationAccounts/runbooks' -and ($resName -eq 'azure-delete' -or $resName -eq 'resource-deletion'))) {
-                Write-Output "   • Skipping protected resource: ${resName} (${resType})"
+            if ($protectedTypes -contains $type) {
+                Write-Output "   • Skipping protected: ${name} (${type})"
                 continue
             }
 
-            Write-Output "   • Deleting: ${resName} (Type: ${resType})"
+            Write-Output "   • Deleting: ${name} (${type})"
             try {
-                Remove-AzResource -ResourceId $resId -ApiVersion $resApiVersion -Force -ErrorAction Stop
-                Write-Output "     ✓ Deleted ${resName}"
+                Remove-AzResource -ResourceId $id -ApiVersion $api -Force -ErrorAction Stop
+                Write-Output "     ✓ Deleted ${name}"
             }
             catch {
-                Write-Warning "     ⚠ Failed to delete ${resName}. Moving to [${trashBinName}]..."
+                Write-Warning "     ⚠ Failed to delete ${name}. Attempting move..."
                 try {
-                    Move-AzResource -ResourceId $resId -DestinationResourceGroupName $trashBinName -Force -ErrorAction Stop
-                    Write-Output "       ✓ Moved ${resName} to ${trashBinName}"
+                    Move-AzResource -ResourceId $id -DestinationResourceGroupName $trashBinName -Force -ErrorAction Stop
+                    Write-Output "       ✓ Moved ${name} to ${trashBinName}"
                 }
                 catch {
-                    Write-Error "       ✗ Failed to move ${resName}: $_"
+                    $errorMsg = $_.Exception.Message
+                    Write-Warning "       ✗ Failed to move ${name}. Exception: ${errorMsg}"
                 }
             }
         }
     }
 }
 
-Write-Output "==============================================="
-Write-Output "Runbook completed at $(Get-Date -Format 'u')"
+Write-Output "`n✅ Cleanup complete at $(Get-Date -Format u)"
