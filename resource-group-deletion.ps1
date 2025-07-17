@@ -40,7 +40,7 @@ foreach ($subObj in $targetSubs) {
         Set-AzContext -SubscriptionId $subId | Out-Null
     }
     catch {
-        Write-Error "❌ Failed to set context to subscription $subId: $($_)"
+        Write-Error "❌ Failed to set context to subscription ${subId}: $($_)"
         continue
     }
 
@@ -64,7 +64,7 @@ foreach ($subObj in $targetSubs) {
             Write-Output "      ✓ Deleted Resource Group: $rgName"
         }
         catch {
-            Write-Error "      ❌ Failed to delete Resource Group [$rgName]: $($_)"
+            Write-Error "      ❌ Failed to delete Resource Group [${rgName}]: $($_)"
         }
     }
 }
