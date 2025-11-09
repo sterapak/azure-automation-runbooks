@@ -4,11 +4,11 @@ This repository contains Azure Automation runbooks used by CIAT to clean up clou
 
 ## `resource-deletion.ps1`
 
-- **Purpose:** Deletes all resource groups (excluding automation and `trashbin-rg`) across the subscriptions listed in the script.
-- **Execution:** Designed for the shared automation account with managed identity; uses parallel deletion so the job completes consistently in under three hours.
-- **How it works:** Removes existing resource locks, then kicks off `Remove-AzResourceGroup` jobs in parallel runspaces with a conservative throttle limit to avoid Azure Automation timeouts.
-- **Default template:** This script is the baseline design for all cleanup runbooks; course-scoped variants reuse the same throttled, parallel pattern to stay within Azure Automation’s job window.
-- **Timeout avoidance:** The concurrency level is tuned so jobs finish within three hours; adjust `$throttle` only if Azure raises or reduces the job concurrency limits.
+- **Purpose:** Deletes individual resources across the target subscriptions while leaving the resource groups themselves intact.
+- **Execution:** Runs under managed identity, walks each subscription and resource group sequentially, and skips automation-related groups plus the `trashbin-rg`.
+- **How it works:** Attempts a direct delete for every resource (with a small protected-type allowlist); if Azure blocks the delete, the resource is moved into `trashbin-rg` for manual follow-up.
+- **Timeout considerations:** This implementation favors reliability over raw speed and no longer relies on large fan‑out job batches. Typical runs stay within Azure Automation’s three-hour window, but runtime scales with the number of resources and dependency errors surfaced by Azure.
+- **Operational notes:** Watch the job logs for `⚠ Failed to delete` / `✓ Moved` lines—they identify resources that ended up in the trash bin because of dependency constraints.
 
 ## Runbook Types
 
@@ -40,7 +40,7 @@ To manually execute a `rgcleanup` runbook:
 ## Known Behaviors
 
 - Some resource types (e.g., Recovery Services Vaults) cannot be deleted via automation and will be moved to a special `trashbin-rg` for manual follow-up.
-- The consolidated `resource-deletion` runbook now completes within the three-hour automation job window under normal load; check Azure Automation job duration if you change the throttle or subscription set.
+- The runbook processes subscriptions sequentially; runtime depends on the volume of resources and Azure throttling, so review job duration after major subscription changes.
 - Splitting work by subscription remains the default approach; consolidate only if you can still guarantee sub-three-hour execution.
 - Logs for each runbook execution can be reviewed under **Automation Account → Runbooks → Jobs → View Logs**.
 
